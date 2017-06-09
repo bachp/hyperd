@@ -3,23 +3,37 @@ package daemon
 import (
 	"fmt"
 
-	"github.com/docker/engine-api/types/container"
+	"github.com/docker/docker/api/types/container"
 )
 
-// ContainerUpdate updates resources of the container
-func (daemon *Daemon) ContainerUpdate(name string, hostConfig *container.HostConfig) ([]string, error) {
+// ContainerUpdate updates configuration of the container
+func (daemon *Daemon) ContainerUpdate(name string, hostConfig *container.HostConfig) (container.ContainerUpdateOKBody, error) {
 	var warnings []string
 
-	warnings, err := daemon.verifyContainerSettings(hostConfig, nil)
+	warnings, err := daemon.verifyContainerSettings(hostConfig, nil, true)
 	if err != nil {
-		return warnings, err
+		return container.ContainerUpdateOKBody{Warnings: warnings}, err
 	}
 
 	if err := daemon.update(name, hostConfig); err != nil {
-		return warnings, err
+		return container.ContainerUpdateOKBody{Warnings: warnings}, err
 	}
 
-	return warnings, nil
+	return container.ContainerUpdateOKBody{Warnings: warnings}, nil
+}
+
+// ContainerUpdateCmdOnBuild updates Path and Args for the container with ID cID.
+func (daemon *Daemon) ContainerUpdateCmdOnBuild(cID string, cmd []string) error {
+	if len(cmd) == 0 {
+		return nil
+	}
+	c, err := daemon.GetContainer(cID)
+	if err != nil {
+		return err
+	}
+	c.Path = cmd[0]
+	c.Args = cmd[1:]
+	return nil
 }
 
 func (daemon *Daemon) update(name string, hostConfig *container.HostConfig) error {
@@ -32,29 +46,47 @@ func (daemon *Daemon) update(name string, hostConfig *container.HostConfig) erro
 		return err
 	}
 
-	if container.RemovalInProgress || container.Dead {
-		return fmt.Errorf("Container is marked for removal and cannot be \"update\".")
-	}
+	restoreConfig := false
+	backupHostConfig := *container.HostConfig
+	defer func() {
+		if restoreConfig {
+			container.Lock()
+			container.HostConfig = &backupHostConfig
+			container.ToDisk()
+			container.Unlock()
+		}
+	}()
 
-	if container.IsRunning() && hostConfig.KernelMemory != 0 {
-		return fmt.Errorf("Can not update kernel memory to a running container, please stop it first.")
+	if container.RemovalInProgress || container.Dead {
+		return errCannotUpdate(container.ID, fmt.Errorf("Container is marked for removal and cannot be \"update\"."))
 	}
 
 	if err := container.UpdateContainer(hostConfig); err != nil {
-		return err
+		restoreConfig = true
+		return errCannotUpdate(container.ID, err)
+	}
+
+	// if Restart Policy changed, we need to update container monitor
+	if hostConfig.RestartPolicy.Name != "" {
+		container.UpdateMonitor(hostConfig.RestartPolicy)
 	}
 
 	// If container is not running, update hostConfig struct is enough,
 	// resources will be updated when the container is started again.
 	// If container is running (including paused), we need to update configs
 	// to the real world.
-	if container.IsRunning() {
-		if err := daemon.execDriver.Update(container.Command); err != nil {
-			return err
+	if container.IsRunning() && !container.IsRestarting() {
+		if err := daemon.containerd.UpdateResources(container.ID, toContainerdResources(hostConfig.Resources)); err != nil {
+			restoreConfig = true
+			return errCannotUpdate(container.ID, err)
 		}
 	}
 
 	daemon.LogContainerEvent(container, "update")
 
 	return nil
+}
+
+func errCannotUpdate(containerID string, err error) error {
+	return fmt.Errorf("Cannot update container %s: %v", containerID, err)
 }

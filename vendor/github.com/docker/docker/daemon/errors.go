@@ -1,26 +1,41 @@
 package daemon
 
 import (
-	"strings"
+	"fmt"
 
-	derr "github.com/docker/docker/errors"
-	"github.com/docker/docker/reference"
+	"github.com/docker/docker/api/errors"
 )
 
 func (d *Daemon) imageNotExistToErrcode(err error) error {
 	if dne, isDNE := err.(ErrImageDoesNotExist); isDNE {
-		if strings.Contains(dne.RefOrID, "@") {
-			return derr.ErrorCodeNoSuchImageHash.WithArgs(dne.RefOrID)
-		}
-		tag := reference.DefaultTag
-		ref, err := reference.ParseNamed(dne.RefOrID)
-		if err != nil {
-			return derr.ErrorCodeNoSuchImageTag.WithArgs(dne.RefOrID, tag)
-		}
-		if tagged, isTagged := ref.(reference.NamedTagged); isTagged {
-			tag = tagged.Tag()
-		}
-		return derr.ErrorCodeNoSuchImageTag.WithArgs(ref.Name(), tag)
+		return errors.NewRequestNotFoundError(dne)
 	}
 	return err
+}
+
+type errNotRunning struct {
+	containerID string
+}
+
+func (e errNotRunning) Error() string {
+	return fmt.Sprintf("Container %s is not running", e.containerID)
+}
+
+func (e errNotRunning) ContainerIsRunning() bool {
+	return false
+}
+
+func errContainerIsRestarting(containerID string) error {
+	err := fmt.Errorf("Container %s is restarting, wait until the container is running", containerID)
+	return errors.NewRequestConflictError(err)
+}
+
+func errExecNotFound(id string) error {
+	err := fmt.Errorf("No such exec instance '%s' found in daemon", id)
+	return errors.NewRequestNotFoundError(err)
+}
+
+func errExecPaused(id string) error {
+	err := fmt.Errorf("Container %s is paused, unpause the container before exec", id)
+	return errors.NewRequestConflictError(err)
 }

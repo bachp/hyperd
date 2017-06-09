@@ -7,20 +7,22 @@ import (
 	"io/ioutil"
 	"net"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 
 	"github.com/Sirupsen/logrus"
+	"github.com/docker/distribution/reference"
 	"github.com/docker/distribution/registry/client/transport"
 	"github.com/docker/docker/distribution/metadata"
 	"github.com/docker/docker/distribution/xfer"
+	"github.com/docker/docker/dockerversion"
 	"github.com/docker/docker/image"
 	"github.com/docker/docker/image/v1"
 	"github.com/docker/docker/layer"
 	"github.com/docker/docker/pkg/ioutils"
 	"github.com/docker/docker/pkg/progress"
 	"github.com/docker/docker/pkg/stringid"
-	"github.com/docker/docker/reference"
 	"github.com/docker/docker/registry"
 	"golang.org/x/net/context"
 )
@@ -36,7 +38,7 @@ type v1Puller struct {
 func (p *v1Puller) Pull(ctx context.Context, ref reference.Named) error {
 	if _, isCanonical := ref.(reference.Canonical); isCanonical {
 		// Allowing fallback, because HTTPS v1 is before HTTP v2
-		return fallbackError{err: registry.ErrNoSupport{Err: errors.New("Cannot pull by digest with v1 registry")}}
+		return fallbackError{err: ErrNoSupport{Err: errors.New("Cannot pull by digest with v1 registry")}}
 	}
 
 	tlsConfig, err := p.config.RegistryService.TLSConfig(p.repoInfo.Index.Name)
@@ -47,10 +49,10 @@ func (p *v1Puller) Pull(ctx context.Context, ref reference.Named) error {
 	tr := transport.NewTransport(
 		// TODO(tiborvass): was ReceiveTimeout
 		registry.NewTransport(tlsConfig),
-		registry.DockerHeaders(p.config.MetaHeaders)...,
+		registry.DockerHeaders(dockerversion.DockerUserAgent(ctx), p.config.MetaHeaders)...,
 	)
 	client := registry.HTTPClient(tr)
-	v1Endpoint, err := p.endpoint.ToV1Endpoint(p.config.MetaHeaders)
+	v1Endpoint, err := p.endpoint.ToV1Endpoint(dockerversion.DockerUserAgent(ctx), p.config.MetaHeaders)
 	if err != nil {
 		logrus.Debugf("Could not get v1 endpoint: %v", err)
 		return fallbackError{err: err}
@@ -65,34 +67,38 @@ func (p *v1Puller) Pull(ctx context.Context, ref reference.Named) error {
 		// TODO(dmcgowan): Check if should fallback
 		return err
 	}
-	progress.Message(p.config.ProgressOutput, "", p.repoInfo.FullName()+": this image was pulled from a legacy registry.  Important: This registry version will not be supported in future versions of docker.")
+	progress.Message(p.config.ProgressOutput, "", p.repoInfo.Name.Name()+": this image was pulled from a legacy registry.  Important: This registry version will not be supported in future versions of docker.")
 
 	return nil
 }
 
 func (p *v1Puller) pullRepository(ctx context.Context, ref reference.Named) error {
-	progress.Message(p.config.ProgressOutput, "", "Pulling repository "+p.repoInfo.FullName())
+	progress.Message(p.config.ProgressOutput, "", "Pulling repository "+p.repoInfo.Name.Name())
 
-	repoData, err := p.session.GetRepositoryData(p.repoInfo)
+	tagged, isTagged := ref.(reference.NamedTagged)
+
+	repoData, err := p.session.GetRepositoryData(p.repoInfo.Name)
 	if err != nil {
 		if strings.Contains(err.Error(), "HTTP code: 404") {
-			return fmt.Errorf("Error: image %s not found", p.repoInfo.RemoteName())
+			if isTagged {
+				return fmt.Errorf("Error: image %s:%s not found", reference.Path(p.repoInfo.Name), tagged.Tag())
+			}
+			return fmt.Errorf("Error: image %s not found", reference.Path(p.repoInfo.Name))
 		}
 		// Unexpected HTTP error
 		return err
 	}
 
-	logrus.Debugf("Retrieving the tag list")
+	logrus.Debug("Retrieving the tag list")
 	var tagsList map[string]string
-	tagged, isTagged := ref.(reference.NamedTagged)
 	if !isTagged {
-		tagsList, err = p.session.GetRemoteTags(repoData.Endpoints, p.repoInfo)
+		tagsList, err = p.session.GetRemoteTags(repoData.Endpoints, p.repoInfo.Name)
 	} else {
 		var tagID string
 		tagsList = make(map[string]string)
-		tagID, err = p.session.GetRemoteTag(repoData.Endpoints, p.repoInfo, tagged.Tag())
+		tagID, err = p.session.GetRemoteTag(repoData.Endpoints, p.repoInfo.Name, tagged.Tag())
 		if err == registry.ErrRepoNotFound {
-			return fmt.Errorf("Tag %s not found in repository %s", tagged.Tag(), p.repoInfo.FullName())
+			return fmt.Errorf("Tag %s not found in repository %s", tagged.Tag(), p.repoInfo.Name.Name())
 		}
 		tagsList[tagged.Tag()] = tagID
 	}
@@ -121,7 +127,7 @@ func (p *v1Puller) pullRepository(ctx context.Context, ref reference.Named) erro
 		}
 	}
 
-	writeStatus(ref.String(), p.config.ProgressOutput, layersDownloaded)
+	writeStatus(reference.FamiliarString(ref), p.config.ProgressOutput, layersDownloaded)
 	return nil
 }
 
@@ -131,7 +137,7 @@ func (p *v1Puller) downloadImage(ctx context.Context, repoData *registry.Reposit
 		return nil
 	}
 
-	localNameRef, err := reference.WithTag(p.repoInfo, img.Tag)
+	localNameRef, err := reference.WithTag(p.repoInfo.Name, img.Tag)
 	if err != nil {
 		retErr := fmt.Errorf("Image (id: %s) has invalid tag: %s", img.ID, img.Tag)
 		logrus.Debug(retErr.Error())
@@ -142,15 +148,15 @@ func (p *v1Puller) downloadImage(ctx context.Context, repoData *registry.Reposit
 		return err
 	}
 
-	progress.Updatef(p.config.ProgressOutput, stringid.TruncateID(img.ID), "Pulling image (%s) from %s", img.Tag, p.repoInfo.FullName())
+	progress.Updatef(p.config.ProgressOutput, stringid.TruncateID(img.ID), "Pulling image (%s) from %s", img.Tag, p.repoInfo.Name.Name())
 	success := false
 	var lastErr error
 	for _, ep := range p.repoInfo.Index.Mirrors {
 		ep += "v1/"
-		progress.Updatef(p.config.ProgressOutput, stringid.TruncateID(img.ID), fmt.Sprintf("Pulling image (%s) from %s, mirror: %s", img.Tag, p.repoInfo.FullName(), ep))
+		progress.Updatef(p.config.ProgressOutput, stringid.TruncateID(img.ID), fmt.Sprintf("Pulling image (%s) from %s, mirror: %s", img.Tag, p.repoInfo.Name.Name(), ep))
 		if err = p.pullImage(ctx, img.ID, ep, localNameRef, layersDownloaded); err != nil {
 			// Don't report errors when pulling from mirrors.
-			logrus.Debugf("Error pulling image (%s) from %s, mirror: %s, %s", img.Tag, p.repoInfo.FullName(), ep, err)
+			logrus.Debugf("Error pulling image (%s) from %s, mirror: %s, %s", img.Tag, p.repoInfo.Name.Name(), ep, err)
 			continue
 		}
 		success = true
@@ -158,12 +164,12 @@ func (p *v1Puller) downloadImage(ctx context.Context, repoData *registry.Reposit
 	}
 	if !success {
 		for _, ep := range repoData.Endpoints {
-			progress.Updatef(p.config.ProgressOutput, stringid.TruncateID(img.ID), "Pulling image (%s) from %s, endpoint: %s", img.Tag, p.repoInfo.FullName(), ep)
+			progress.Updatef(p.config.ProgressOutput, stringid.TruncateID(img.ID), "Pulling image (%s) from %s, endpoint: %s", img.Tag, p.repoInfo.Name.Name(), ep)
 			if err = p.pullImage(ctx, img.ID, ep, localNameRef, layersDownloaded); err != nil {
 				// It's not ideal that only the last error is returned, it would be better to concatenate the errors.
 				// As the error is also given to the output stream the user will see the error.
 				lastErr = err
-				progress.Updatef(p.config.ProgressOutput, stringid.TruncateID(img.ID), "Error pulling image (%s) from %s, endpoint: %s, %s", img.Tag, p.repoInfo.FullName(), ep, err)
+				progress.Updatef(p.config.ProgressOutput, stringid.TruncateID(img.ID), "Error pulling image (%s) from %s, endpoint: %s, %s", img.Tag, p.repoInfo.Name.Name(), ep, err)
 				continue
 			}
 			success = true
@@ -171,7 +177,7 @@ func (p *v1Puller) downloadImage(ctx context.Context, repoData *registry.Reposit
 		}
 	}
 	if !success {
-		err := fmt.Errorf("Error pulling image (%s) from %s, %v", img.Tag, p.repoInfo.FullName(), lastErr)
+		err := fmt.Errorf("Error pulling image (%s) from %s, %v", img.Tag, p.repoInfo.Name.Name(), lastErr)
 		progress.Update(p.config.ProgressOutput, stringid.TruncateID(img.ID), err.Error())
 		return err
 	}
@@ -237,13 +243,15 @@ func (p *v1Puller) pullImage(ctx context.Context, v1ID, endpoint string, localNa
 		return err
 	}
 
-	imageID, err := p.config.ImageStore.Create(config)
+	imageID, err := p.config.ImageStore.Put(config)
 	if err != nil {
 		return err
 	}
 
-	if err := p.config.ReferenceStore.AddTag(localNameRef, imageID, true); err != nil {
-		return err
+	if p.config.ReferenceStore != nil {
+		if err := p.config.ReferenceStore.AddTag(localNameRef, imageID, true); err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -278,6 +286,7 @@ type v1LayerDescriptor struct {
 	layersDownloaded *bool
 	layerSize        int64
 	session          *registry.Session
+	tmpFile          *os.File
 }
 
 func (ld *v1LayerDescriptor) Key() string {
@@ -307,7 +316,7 @@ func (ld *v1LayerDescriptor) Download(ctx context.Context, progressOutput progre
 	}
 	*ld.layersDownloaded = true
 
-	tmpFile, err := ioutil.TempFile("", "GetImageBlob")
+	ld.tmpFile, err = ioutil.TempFile("", "GetImageBlob")
 	if err != nil {
 		layerReader.Close()
 		return nil, 0, err
@@ -316,17 +325,41 @@ func (ld *v1LayerDescriptor) Download(ctx context.Context, progressOutput progre
 	reader := progress.NewProgressReader(ioutils.NewCancelReadCloser(ctx, layerReader), progressOutput, ld.layerSize, ld.ID(), "Downloading")
 	defer reader.Close()
 
-	_, err = io.Copy(tmpFile, reader)
+	_, err = io.Copy(ld.tmpFile, reader)
 	if err != nil {
+		ld.Close()
 		return nil, 0, err
 	}
 
 	progress.Update(progressOutput, ld.ID(), "Download complete")
 
-	logrus.Debugf("Downloaded %s to tempfile %s", ld.ID(), tmpFile.Name())
+	logrus.Debugf("Downloaded %s to tempfile %s", ld.ID(), ld.tmpFile.Name())
 
-	tmpFile.Seek(0, 0)
-	return ioutils.NewReadCloserWrapper(tmpFile, tmpFileCloser(tmpFile)), ld.layerSize, nil
+	ld.tmpFile.Seek(0, 0)
+
+	// hand off the temporary file to the download manager, so it will only
+	// be closed once
+	tmpFile := ld.tmpFile
+	ld.tmpFile = nil
+
+	return ioutils.NewReadCloserWrapper(tmpFile, func() error {
+		tmpFile.Close()
+		err := os.RemoveAll(tmpFile.Name())
+		if err != nil {
+			logrus.Errorf("Failed to remove temp file: %s", tmpFile.Name())
+		}
+		return err
+	}), ld.layerSize, nil
+}
+
+func (ld *v1LayerDescriptor) Close() {
+	if ld.tmpFile != nil {
+		ld.tmpFile.Close()
+		if err := os.RemoveAll(ld.tmpFile.Name()); err != nil {
+			logrus.Errorf("Failed to remove temp file: %s", ld.tmpFile.Name())
+		}
+		ld.tmpFile = nil
+	}
 }
 
 func (ld *v1LayerDescriptor) Registered(diffID layer.DiffID) {

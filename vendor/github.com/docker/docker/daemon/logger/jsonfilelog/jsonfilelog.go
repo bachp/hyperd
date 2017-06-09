@@ -25,7 +25,6 @@ type JSONFileLogger struct {
 	buf     *bytes.Buffer
 	writer  *loggerutils.RotateFileWriter
 	mu      sync.Mutex
-	ctx     logger.Context
 	readers map[*logger.LogWatcher]struct{} // stores the active log followers
 	extra   []byte                          // json-encoded extra attributes
 }
@@ -41,9 +40,9 @@ func init() {
 
 // New creates new JSONFileLogger which writes to filename passed in
 // on given context.
-func New(ctx logger.Context) (logger.Logger, error) {
+func New(info logger.Info) (logger.Logger, error) {
 	var capval int64 = -1
-	if capacity, ok := ctx.Config["max-size"]; ok {
+	if capacity, ok := info.Config["max-size"]; ok {
 		var err error
 		capval, err = units.FromHumanSize(capacity)
 		if err != nil {
@@ -51,7 +50,7 @@ func New(ctx logger.Context) (logger.Logger, error) {
 		}
 	}
 	var maxFiles = 1
-	if maxFileString, ok := ctx.Config["max-file"]; ok {
+	if maxFileString, ok := info.Config["max-file"]; ok {
 		var err error
 		maxFiles, err = strconv.Atoi(maxFileString)
 		if err != nil {
@@ -62,13 +61,17 @@ func New(ctx logger.Context) (logger.Logger, error) {
 		}
 	}
 
-	writer, err := loggerutils.NewRotateFileWriter(ctx.LogPath, capval, maxFiles)
+	writer, err := loggerutils.NewRotateFileWriter(info.LogPath, capval, maxFiles)
 	if err != nil {
 		return nil, err
 	}
 
 	var extra []byte
-	if attrs := ctx.ExtraAttributes(nil); len(attrs) > 0 {
+	attrs, err := info.ExtraAttributes(nil)
+	if err != nil {
+		return nil, err
+	}
+	if len(attrs) > 0 {
 		var err error
 		extra, err = json.Marshal(attrs)
 		if err != nil {
@@ -91,20 +94,26 @@ func (l *JSONFileLogger) Log(msg *logger.Message) error {
 		return err
 	}
 	l.mu.Lock()
-	defer l.mu.Unlock()
+	logline := msg.Line
+	if !msg.Partial {
+		logline = append(msg.Line, '\n')
+	}
 	err = (&jsonlog.JSONLogs{
-		Log:      append(msg.Line, '\n'),
+		Log:      logline,
 		Stream:   msg.Source,
 		Created:  timestamp,
 		RawAttrs: l.extra,
 	}).MarshalJSONBuf(l.buf)
+	logger.PutMessage(msg)
 	if err != nil {
+		l.mu.Unlock()
 		return err
 	}
 
 	l.buf.WriteByte('\n')
 	_, err = l.writer.Write(l.buf.Bytes())
 	l.buf.Reset()
+	l.mu.Unlock()
 
 	return err
 }
@@ -117,6 +126,7 @@ func ValidateLogOpt(cfg map[string]string) error {
 		case "max-size":
 		case "labels":
 		case "env":
+		case "env-regex":
 		default:
 			return fmt.Errorf("unknown log opt '%s' for json-file log driver", key)
 		}
